@@ -1,0 +1,814 @@
+---
+title: "Immune module analysis"
+author: "Ellis Patrick"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 3
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE, fig.path = "Figures/")
+```
+
+```{r packages, echo = FALSE}
+library(tidyverse)
+library(ggrepel)
+library(scales)
+library(goseq)
+library(GO.db)
+library(glasso)
+library(igraph)
+library(edgebundleR)
+library(gplots)
+library(lme4)
+library(DT)
+library(limma)
+```
+
+
+
+
+```{r readData}
+# Read in rosmap data
+# Phenotype information
+rosmap <- read.csv("Data/Clinical.csv", row.names = 1)
+
+# Bulk gene expression
+bulkExpr <- read.csv("Data/bulkFPKM.csv", row.names = 1)
+colnames(bulkExpr) <- sub("X","", colnames(bulkExpr))
+
+# Microglia gene expression
+microgliaExpr <- read.csv("Data/microgliaFPKM.csv", row.names = 1)
+
+# Read in modules
+module <- read.delim("Data/cluster_assignment_ens.tab.txt", header = FALSE)
+mod2ens <- split(module[, 2], module[, 3])
+mod2ens <- lapply(mod2ens, function(x) unique(unlist(lapply(strsplit(as.character(x), "\\."), function(z) z[1]))))
+mod2ens <- lapply(mod2ens, intersect, rownames(bulkExpr))
+mod2ens <- mod2ens[unlist(lapply(mod2ens, length)) > 19]
+
+# Read in activate microglia proportions.
+activatedMicroglia <- read.csv("Data/activatedMicroglia.csv", row.names = 1)
+  
+  
+  
+```
+
+```{r geneData}
+# Download annotation information for genes
+
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", GRCh = 37)
+all_genes <- getBM(attributes = c(
+  "ensembl_gene_id",
+  "hgnc_symbol", "uniprot_gn_id", "external_gene_name", "percentage_gene_gc_content", "start_position", "end_position", "description", "entrezgene_id", "chromosome_name"
+), mart = ensembl)
+chr <- c(1:22, c("X", "Y", "MT"))
+all_genes <- all_genes[all_genes$chromosome_name %in% chr, ]
+
+
+geneSymbol <- all_genes$external_gene_name
+names(geneSymbol) <- all_genes$ensembl_gene_id
+
+rgeneSymbol <- all_genes$ensembl_gene_id
+names(rgeneSymbol) <- all_genes$external_gene_name
+
+uniprot <- all_genes$uniprot_gn
+names(uniprot) <- all_genes$ensembl_gene_id
+
+GC <- all_genes$percentage_gene_gc_content
+names(GC) <- all_genes$ensembl_gene_id
+
+len <- all_genes$end_position - all_genes$start_position
+names(len) <- all_genes$ensembl_gene_id
+
+desc <- all_genes$description
+names(desc) <- all_genes$ensembl_gene_id
+
+
+```
+
+
+# Figure 1 – Enrichment analysis identifies m116 as the most microglia related cortical gene co-expression module
+
+
+
+```{r combineBulkMicroglia}
+## Integrate Microglia with Bulk tissue
+
+# Combine microglia data with ROSMAP data
+int <- intersect(rownames(microgliaExpr), rownames(bulkExpr))
+int <- intersect(int, names(which(uniprot != "")))
+int <- names(which(!is.na(GC[int])))
+combinedExpr <- cbind(microgliaExpr[int, ], rowMeans(bulkExpr[int, ]))
+combinedExpr <- combinedExpr[!is.na(rowSums(combinedExpr)), ]
+
+groups <- rep(c("Microglia","Bulk"),c(10,1))
+
+
+a1 <- rowMeans(combinedExpr[, groups == "Microglia"])
+a2 <- (combinedExpr[, groups == "Bulk"])
+names(a2) = names(a1)
+A <- a1 + a2
+A <- rowMeans(combinedExpr)
+tmm <- function(DAT, A) {
+  library(locfit)
+  TMM <- as.matrix(DAT)
+  TMM[] <- NA
+  for (i in (1:dim(DAT)[2])) {
+    big <- names(which(A > 20 & DAT[names(A), i] > 0))
+    Y <- log(DAT[big, i]) - log(A)[big]
+    big <- names(which(Y < mad(Y) * 8 & Y > -mad(Y) * 8))
+    Y <- log(DAT[big, i]) - log(A)[big]
+    x <- GC[big]
+    z <- log10(len[big])
+    fit <- locfit.robust(Y ~ lp(z, x, nn = .7))
+    use <- names(which((!is.na(GC[rownames(DAT)])) & (!is.na(log10(len[rownames(DAT)])))))
+    X <- data.frame(x = GC[rownames(DAT)], z = log10(len[rownames(DAT)]))
+    TMM1 <- predict(fit, X)
+    names(TMM1) <- use
+    TMM[names(TMM1), i] <- exp(TMM1)
+    TMM[is.na(TMM[, i]), i] <- mean(exp(TMM1))
+  }
+  TMM <- ((TMM) / exp(mean(log(TMM))))
+  TMM <- 1 / TMM
+  TMM
+}
+
+# Integrate with TMM including GC content and length bias
+TMM <- tmm(combinedExpr, A)
+combinedExpr <- combinedExpr * TMM
+```
+
+
+```{r defineMicrogliaGene}
+## Identify genes that have higher expression in Microglia than Bulk tissue
+
+# Test for differences between ROSMAP and Microglia
+design <- model.matrix(~groups)
+colnames(design) <- gsub("groups", "", colnames(design))
+
+fit <- lmFit(log2(combinedExpr + 0.5), design)
+ordinary.t <- fit$coef / fit$stdev.unscaled / fit$sigma
+Tmicroglia <- ordinary.t[, "Microglia"]
+Pmicroglia <- 2 * pt(abs(Tmicroglia), fit$df.res, lower.tail = FALSE)
+padj <- p.adjust(Pmicroglia, "fdr")
+
+
+MvsB <- Tmicroglia
+cMvsB <- fit$coef[, "Microglia"]
+MicrogliaGenes <- names(which(padj < 0.05 & cMvsB > 0))
+BulkGenes <- names(which(padj < 0.05 & cMvsB < 0))
+
+a1 = rowMeans(combinedExpr[,groups=='Microglia'])
+a2 = combinedExpr[,groups=='Bulk']
+names(a2) <- names(a1)
+MicrogliaGenesFC <- names(which(a1 > 10 & a1 / a2 > 4))
+
+```
+
+
+```{r modEnrich}
+## Which modules are enriched for microglia genes?
+
+hyperTest <- function(list,topG){
+  u <- unique(unlist(list))
+  P <- lapply(list,function(i){
+  q <- length(intersect(i, topG))
+  m <- sum(topG %in% u)
+  n <- sum(!u %in% topG)
+  k <- length(i)
+  phyper(q, m, n, k, lower.tail = FALSE) + dhyper(q, m, n, k)
+  })
+unlist(P)
+}
+
+# Modules enriched for fold change > 4 microglia genes
+topG <- MicrogliaGenesFC
+P <- hyperTest(mod2ens,topG)
+PmicrogliaFCOR <- P
+k <- data.frame(Number.Genes = unlist(lapply(mod2ens, length))[names(P)], Number.Microglia.Genes = unlist(lapply(mod2ens, function(x) sum(x %in% MicrogliaGenesFC)))[names(P)], P.value = signif(P, 2))
+k <- k[order(k$P.value), ]
+```
+
+
+
+
+```{r Figure_1, fig.height=7, fig.width=7}
+## Figure 1 – Enrichment analysis identifies m116 as the most microglia related cortical gene co-expression module
+
+pdata <- data.frame(Gene = geneSymbol[names(a1)], Ensembl = names(a1), GliaGeneFC = names(a1) %in% MicrogliaGenesFC, GliaGeneFC2 = paste(names(a1) %in% MicrogliaGenesFC, 1, sep = ""), Fold.Change = a1 / a2, Glia.expression = a1[names(a1)] + 1, Bulk.expression = a2[names(a1)] + 1, ADgene = c("notAD", "AD")[names(a1) %in% mod2ens[["116"]] + 1])
+rownames(pdata) <- pdata$Ensembl
+
+pdataSelect <- pdata[pdata$Ensembl %in% mod2ens[["116"]], ]
+
+p1 <- ggplot(data = pdata, aes(x = Glia.expression, y = Bulk.expression)) +
+  geom_point(aes(color = factor(GliaGeneFC))) +
+  scale_y_log10(labels = comma) +
+  scale_x_log10() +
+  scale_color_manual(values = c("FALSE" = "snow2", "TRUE" = "steelblue1", "FALSE1" = "snow4", "TRUE1" = "steelblue2", "AD" = "gray50"), name = NULL, breaks = c("TRUE", "AD"), labels = c("Microglia gene", "Module 116 gene")) +
+  theme_bw(base_size = 14) +
+  geom_abline(col = "darkgray", size = 1.2) +
+  geom_point(data = pdataSelect, aes(color = ADgene), size = 2) +
+  labs(x = "Microglia expression", y = "Bulk tissue expression", title = "Module 116", subtitle = paste("Enrichment p-value = ", signif(P["116"], 2), sep = "")) +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5)) +
+  theme(
+    legend.position = c(0.04, 0.965),
+    legend.justification = c("left", "top"),
+    legend.background = element_rect(
+      fill = NULL, colour = "black", size = .2, linetype = 1,
+      color = NULL
+    )
+  ) +
+  guides(colour = guide_legend(override.aes = list(size = 2)))
+
+p1
+
+
+```
+
+
+
+# Table 1 - Enrichment of gene co-expression modules for microglia related genes
+
+
+```{r cAD_DE}
+## Are there any genes associated with cognitive decline?
+
+design <- model.matrix(~cogDec + studyn + educ + msex + age_death + PMI + RIN,rosmap)
+fit <- lmFit(log2(bulkExpr[,rownames(design)] + 0.5), design)
+ordinary.t <- fit$coef / fit$stdev.unscaled / fit$sigma
+TAD <- ordinary.t[, "cogDec"]
+PAD <- 2 * pt(abs(TAD), fit$df.res, lower.tail = FALSE)
+padjAD <- p.adjust(PAD, "fdr")
+
+```
+
+
+
+```{r amyloid_tangles_DE}
+## Are there any genes associated with amyloid or tau pathology?
+
+# Amyloid
+
+design <- model.matrix(~AM + studyn + educ + msex + age_death + PMI + RIN,rosmap)
+
+fit <- lmFit(log2(bulkExpr[,rownames(design)] + 0.5), design)
+ordinary.t <- fit$coef / fit$stdev.unscaled / fit$sigma
+TAM <- ordinary.t[, "AM"]
+PAM <- 2 * pt(abs(TAM), fit$df.res, lower.tail = FALSE)
+padjAM <- p.adjust(PAM, "fdr")
+
+# Tangles
+design <- model.matrix(~TA + studyn + educ + msex + age_death + PMI + RIN,rosmap)
+
+fit <- lmFit(log2(bulkExpr[,rownames(design)] + 0.5), design)
+ordinary.t <- fit$coef / fit$stdev.unscaled / fit$sigma
+TTA <- ordinary.t[, "TA"]
+PTA <- 2 * pt(abs(TAM), fit$df.res, lower.tail = FALSE)
+padjTA <- p.adjust(PTA, "fdr")
+
+
+# Plaques
+design <- model.matrix(~NP + studyn + educ + msex + age_death + PMI + RIN,rosmap)
+
+fit <- lmFit(log2(bulkExpr[,rownames(design)] + 0.5), design)
+ordinary.t <- fit$coef / fit$stdev.unscaled / fit$sigma
+TNP <- ordinary.t[, "NP"]
+PNP <- 2 * pt(abs(TNP), fit$df.res, lower.tail = FALSE)
+padjNP <- p.adjust(PNP, "fdr")
+
+
+# NFT
+design <- model.matrix(~NFT + studyn + educ + msex + age_death + PMI + RIN,rosmap)
+
+fit <- lmFit(log2(bulkExpr[,rownames(design)] + 0.5), design)
+ordinary.t <- fit$coef / fit$stdev.unscaled / fit$sigma
+TNFT <- ordinary.t[, "NFT"]
+PNFT <- 2 * pt(abs(TNFT), fit$df.res, lower.tail = FALSE)
+padjNFT <- p.adjust(PNFT, "fdr")
+
+```
+
+
+
+
+```{r BP2ens}
+## Read Pathway information
+
+BP <- getgo(unlist(mod2ens), genome = "hg19", id = "ensGene")
+BP2ens <- Biobase::reverseSplit(BP)
+xx <- as.list(GOTERM)
+gomap <- unlist(lapply(xx, Term))
+names(BP2ens) <- gomap[names(BP2ens)]
+```
+
+
+
+
+```{r modulesVsTraits}
+## What pathologies are modules associated with?
+
+# Is the average expression of a module associated with pathology?
+ModResults <- matrix(NA, length(mod2ens), ncol(rosmap))
+rownames(ModResults) <- names(mod2ens)
+colnames(ModResults) <- colnames(rosmap)
+
+
+# Calculate average expression for each module
+Dat <- log2(bulkExpr[unlist(mod2ens), ] + 0.5)
+Dat <- sweep(Dat,1,apply(Dat, 1, sd),"/")
+
+modExpr <- lapply(mod2ens, function(x) apply(Dat[intersect(x, rownames(Dat)), ], 2, mean, na.rm = TRUE))
+modExpr <- do.call("rbind", modExpr)
+
+ModResultsCoef <- ModResults
+for (j in colnames(rosmap)) {
+  y <- rosmap[,j]
+  x <- rosmap[,c("studyn", "educ", "msex", "age_death", "PMI", "RIN")]
+  for (i in names(mod2ens)) {
+    if (length(unique(y)[!is.na(unique(y))]) > 1) {
+      cx <- suppressWarnings(apply(x, 2, cor, y, use = "complete"))
+      x1 <- x[, which(abs(cx) != 1)]
+      z <- modExpr[i, ]
+      fit <- lm(y ~ z + ., x1)
+      ModResults[i, j] <- coef(summary(fit))[2, 4]
+      ModResultsCoef[i, j] <- coef(summary(fit))[2, 1]
+    }
+  }
+}
+
+```
+
+
+
+
+
+```{r modulesPathwaysEnriched}
+## Which pathways are enriched in each module?
+
+BPlen <- unlist(lapply(BP2ens, length))
+pathOR <- NULL
+pathOR2 <- list()
+for (j in c("116", "115", "114", "113", "5")) {
+  library(limma)
+  P <- K <- Q <- G <- NULL
+  u <- intersect(unique(unlist(BP2ens)), unique(unlist(mod2ens)))
+  topG <- intersect(mod2ens[[j]], u)
+  for (i in names(which(BPlen > 20 & BPlen < 500))) {
+    q <- length(intersect(BP2ens[[i]], topG))
+    m <- sum(topG %in% u)
+    n <- sum(!u %in% topG)
+    k <- sum(u %in% BP2ens[[i]])
+    K[i] <- k
+    Q[i] <- q
+    G[i] <- paste(geneSymbol[intersect(BP2ens[[i]], topG)], collapse = ", ")
+    P[i] <- phyper(q, m, n, k, lower.tail = FALSE) + dhyper(q, m, n, k)
+  }
+  pathOR[j] <- paste(names(head(sort(P), 6)), collapse = ", ")
+  pathOR2[[j]] <- data.frame(mod = j, Pathway = names(P), P, K, Q, G)
+}
+
+```
+
+
+```{r moduleResultsTable}
+## Table 1 - Enrichment of gene co-expression modules for microglia related genes
+
+PGFC <- sort(PmicrogliaFCOR)
+NGG <- sort(unlist(lapply(mod2ens, function(x) sum(x %in% MicrogliaGenesFC))))
+Nmod <- unlist(lapply(mod2ens, length))
+NamAD <- (unlist(lapply(mod2ens, function(x) paste(geneSymbol[names(which(padjAD[intersect(x, MicrogliaGenesFC)] < 0.05))], collapse = ", "))))
+
+use <- names(mod2ens)
+X <- data.frame(Module = paste("mod", use, sep = ""), pval.Microglia.in.mod = PmicrogliaFCOR[use], Number.of.microglia.Genes = NGG[use], Number.of.genes.in.Mod = Nmod[use], Cogn.Microglia.Genes = NamAD[use], Pathways = pathOR[use])
+
+X <- X[order(X$pval.Microglia.in.mod), ]
+X[, 2] <- signif(X[, 2], 2)
+
+
+use <- c("116", "5", "115", "114", "113", "109")
+Y <- X[use, ]
+Y <- Y[order(Y$pval.Microglia.in.mod), ]
+
+DT::datatable(Y,  escape = FALSE, caption = "Table 1 - Enrichment of gene co-expression modules for microglia related genes",
+                            options = list(
+                                paging = TRUE,
+                                searching = TRUE,
+                                fixedColumns = TRUE,
+                                autoWidth = TRUE,
+                                ordering = TRUE,
+                                dom = 'Bfrtip'
+                            )
+                       )
+
+```
+
+
+
+# Figure 2a and 2b - Relationships between gene modules and Alzheimer’s disease traits.
+
+
+```{r constructNetwork, fig.height = 7, fig.width = 7}
+## Construct network
+
+pathologies <- c("cogn_global_random_slope", "np_sqrt", "dp_sqrt", "nft_sqrt", "tangles_sqrt", "amyloid_sqrt")
+x <- cbind(rosmap, t(log(modExpr[c("116", "115", "5", "114", "113"),])))
+x <- na.omit(x)
+
+set.seed(51773)
+LAM <- NULL
+for (k in 1:100) {
+  folds <- split(sample(rownames(x), dim(x)[1]), ceiling((1:dim(x)[1]) / (dim(x)[1] / 5 + .1)))
+  lambda <- 5:40 / 100
+
+  mcc <- NULL
+  for (j in 1:length(lambda)) {
+    lam <- lambda[j]
+    mc <- NULL
+    for (i in 1:length(folds)) {
+      test <- folds[[i]]
+      train <- unlist(folds[-i])
+
+      xTrain <- x[train, ]
+      c1 <- cor(xTrain)
+
+      WI1 <- glasso(c1, abs(lam), penalize.diagonal = TRUE)$wi
+      colnames(WI1) <- rownames(WI1) <- colnames(x)
+
+      xTest <- x[test, ]
+      c2 <- cor(xTest)
+
+      M <- c2 %*% WI1
+
+      mc[i] <- mean(M[row(M) > col(M)]^2)
+    }
+    mcc[j] <- mean(mc)
+  }
+  LAM[k] <- lambda[which.min(mcc)[1]]
+}
+
+
+#plot(lambda, mcc)
+
+lam <- mean(LAM)
+
+c1 <- cor(x)
+WI1 <- glasso(c1, abs(lam))$wi
+colnames(WI1) <- rownames(WI1) <- colnames(x)
+WI1 <- -cov2cor(WI1)
+diag(WI1) <- NA
+
+
+colnames(WI1) <- rownames(WI1) <- gsub("msex", "Sex", rownames(WI1))
+colnames(WI1) <- rownames(WI1) <- gsub("age_death", "Age", rownames(WI1))
+colnames(WI1) <- rownames(WI1) <- gsub("cogDec", "4.CogDec", rownames(WI1))
+colnames(WI1) <- rownames(WI1) <- gsub("_sqrt", "", rownames(WI1))
+colnames(WI1)[colnames(WI1) %in% c("109", "116", "115", "5", "114", "113")] <- rownames(WI1)[colnames(WI1) %in% c("109", "116", "115", "5", "114", "113")] <- paste("1.mod", colnames(WI1)[colnames(WI1) %in% c("109", "116", "115", "5", "114", "113")], sep = "")
+
+colnames(WI1)[colnames(WI1) %in% c("NP", "DP", "NFT", "TA", "AM")] <- rownames(WI1)[colnames(WI1) %in% c("NP", "DP", "NFT", "TA", "AM")] <- paste("2.", rownames(WI1)[colnames(WI1) %in% c("NP", "DP", "NFT", "TA", "AM")], sep = "")
+
+colnames(WI1)[colnames(WI1) %in% c("Sex", "Age")] <- rownames(WI1)[colnames(WI1) %in% c("Sex", "Age")] <- paste("3.", colnames(WI1)[colnames(WI1) %in% c("Sex", "Age")], sep = "")
+
+colnames(WI1) <- rownames(WI1) <- sub("TA", "Tau", colnames(WI1))
+colnames(WI1) <- rownames(WI1) <- sub("AM", "Amyloid", colnames(WI1))
+
+Results <- WI1
+Results <- Results[grep("\\.", colnames(Results)), grep("\\.", colnames(Results))]
+
+
+Links <- NULL
+for (i in rownames(Results)) {
+  Links <- rbind(Links, cbind(i, names(which(Results[, i] != 0))))
+}
+un <- unique(as.vector(Links))
+sign <- NULL
+for (i in names(which(colSums(Results != 0, na.rm = TRUE) != 0))) {
+  sign <- c(sign, sign(Results[names(which(Results[, i] != 0)), i]))
+}
+Links <- cbind(Links, sign)
+size <- rep(30, length(un))
+size[un %in% colnames(Results)] <- 40
+Nodes <- data.frame(name = un, group = size, size)
+
+map <- rownames(Nodes)
+names(map) <- Nodes[, 1]
+
+colnames(Links) <- c("source", "target", "value")
+Links <- as.data.frame(Links)
+Links <- Links[order(Links[, 1]), ]
+network <- graph.data.frame(d = Links, vertices = Nodes, directed = F)
+
+net <- network
+cat <- unlist(lapply(strsplit(colnames(Results), "\\."), function(x) x[1]))
+cat <- as.factor(cat)
+levels(cat) <- c("lightskyblue", "black", "#009E73", "salmon")
+levels(cat) <- c("#7570b3", "#d95f02", "#1b9e77", "black")
+
+
+V(net)$color <- as.character(cat)
+
+
+```
+
+
+
+### Figure 2a - Edge bundled network
+
+
+```{r Figure 2a, fig.width=7, fig.height=7, results='asis'}
+edgebundle(net, tension = 0.1)
+```
+
+### Figure 2b - Heatmap network
+
+
+```{r Figure 2b, fig.width=5, fig.height=5}
+X <- (WI1)
+X <- X[grep("\\.", colnames(X)), grep("\\.", colnames(X))]
+colnames(X) <- rownames(X) <- unlist(lapply(strsplit(colnames(X), "\\."), function(x) x[2]))
+
+heatmap.2(X, trace = "none", col = colorRampPalette(c("lightskyblue", "lightskyblue", "lightskyblue", "lightskyblue", "lightskyblue", "cornsilk", "salmon", "salmon", "salmon", "salmon", "salmon"))(10000), key.xlab = "Partial correlation", density.info = "none", keysize = 1.2)
+
+```
+
+
+### Figure 2c - Mediation analysis
+
+
+```{r mediationAnalysis}
+y <- t(modExpr[c("5", "114", "113", "115", "116"), ])
+colnames(y) <- paste("m", colnames(y), sep = "")
+
+x <- data.frame(rosmap,y)
+
+
+# Triangle mod5-tau-cogdec
+
+coef(summary(lm(cogDec ~ TA + RIN, x)))
+coef(summary(lm(cogDec ~ TA + m5 + RIN, x)))
+
+coef(summary(lm(cogDec ~ m5 + RIN, x)))
+coef(summary(lm(cogDec ~ m5 + TA + RIN, x)))
+
+coef(summary(lm(TA ~ m5 + RIN, x)))
+coef(summary(lm(TA ~ m5 + cogDec + RIN, x)))
+
+
+```
+
+
+
+
+# Figure 3 – Association of genes and modules with microglia morphology.
+
+
+
+```{r ActivatedMicroglia}
+## Genes and modules associated with microglia
+
+activatedMicroglia <- read.csv("Data/activatedMicroglia.csv", row.names = 1)
+
+x <- data.frame(activatedMicroglia = activatedMicroglia[,1],rosmap[rownames(activatedMicroglia),c("educ", "msex", "age_death","RIN","PMI")])
+design <- model.matrix(~., x)
+
+
+fit <- suppressWarnings(lmFit(log2(bulkExpr[unlist(mod2ens), rownames(design)] + 0.5), design, method = "robust"))
+ordinary.t <- fit$coef / fit$stdev.unscaled / fit$sigma
+TG <- ordinary.t[, "activatedMicroglia"]
+PG <- 2 * pt(abs(TG), fit$df.res, lower.tail = FALSE)
+
+
+fit <- suppressWarnings(lmFit(modExpr[, rownames(design)], design))
+ordinary.t <- fit$coef / fit$stdev.unscaled / fit$sigma
+TGm <- ordinary.t[, "activatedMicroglia"]
+PGm <- 2 * pt(abs(TGm), fit$df.res, lower.tail = FALSE)
+CGm <- fit$coef[, "activatedMicroglia"]
+
+```
+
+
+### Figure 3a - Genes associated with activated microglia and cognitive decline
+
+
+```{r Figure_3a, fig.height=5, fig.width=5}
+
+plot(TAD[names(TG)], TG, col = "grey", pch = 19, cex = .25, xlab = "Cognitive decline t-statistic", ylab = "Activated microglia t-statistic", xaxt = "n")
+title(main = "Gene associations with activated microglia \n and cognitive decline", line = 0.5)
+axis(1, at = (-3:3) * 2)
+abline(h = (-3:3) * 2, v = (-3:3) * 2, col = "lightgray", lty = "dotted")
+abline(h = 0, v = 0, col = "darkgray", lty = 2)
+col <- rgb(0, 0, 1, 0.4)
+cex <- .6
+xShift <- 0.9
+offset <- .15
+points(TAD[mod2ens[["5"]]], TG[mod2ens[["5"]]], col = col, pch = 19, cex = cex)
+use1 <- c("ENSG00000087206")
+text(TAD[use1], TG[use1], geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000196739")
+text(TAD[use1], TG[use1], geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000197956")
+text(TAD[use1], TG[use1] - .15, geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000123136")
+text(TAD[use1], TG[use1] - .05, geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000105202")
+text(TAD[use1], TG[use1] + .1, geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000105643")
+text(TAD[use1], TG[use1] + .14, geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000170638")
+text(TAD[use1], TG[use1] - .2, geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000198909")
+text(TAD[use1], TG[use1] - .1, geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset * 2)
+use1 <- c("ENSG00000125753")
+text(TAD[use1], TG[use1] + .09, geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000107816")
+text(TAD[use1], TG[use1] + .21, geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000065882")
+text(TAD[use1], TG[use1] + .25, geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000143303")
+text(TAD[use1], TG[use1], geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000072778")
+text(TAD[use1], TG[use1], geneSymbol[use1], col = 4, cex = cex, pos = 3, offset = offset)
+use1 <- c("ENSG00000154222")
+text(TAD[use1], TG[use1], geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000160796")
+text(TAD[use1], TG[use1], geneSymbol[use1], col = 4, cex = cex, pos = 2, offset = offset)
+use1 <- c("ENSG00000157927")
+text(TAD[use1], TG[use1] + .05, geneSymbol[use1], col = 4, cex = cex, pos = 4, offset = offset)
+use1 <- c("ENSG00000119725")
+text(TAD[use1], TG[use1], geneSymbol[use1], col = 4, cex = cex, pos = 4, offset = offset)
+legend("topright", "Module 5 genes", pch = 19, col = col, cex = .75)
+
+
+```
+
+
+### Figure 3b - Module associations with activated microglia and cognitive decline
+
+```{r Figure_3b, fig.height=5, fig.width=5}
+
+
+design <- model.matrix(~studyn +educ+ msex+ age_death + PMI + RIN + cogDec, rosmap)
+Dat <- modExpr[, rownames(design)]
+
+fit <- lmFit(log2(Dat + 0.5), design, trend = TRUE)
+ordinary.t <- fit$coef / fit$stdev.unscaled / fit$sigma
+TADmod <- ordinary.t[, "cogDec"]
+TADmod[c("115", "112", "116")] <- TADmod[c("115", "112", "116")] + c(0, 0.2, +.4)
+TGm2 <- TGm
+TGm2["112"] <- TGm2["112"] - .2
+cex <- rank(-PmicrogliaFCOR)^2
+cex <- (sqrt(cex / (mean(cex)) + 1))^.8 * 2
+col <- colorRampPalette(c("darkblue", "wheat4", "darkred"))(length(cex))[rank(cex)]
+col2 <- colorRampPalette(c("lightblue", "wheat1", "pink"), alpha = .1)(length(cex))[rank(cex)]
+
+plot(TADmod[names(PmicrogliaFCOR)], TGm2[names(PmicrogliaFCOR)], cex = cex, col = col2, pch = 19, xlab = "Cognitive decline t-statistic", ylab = "Activated microglia t-statistic", xlim = c(-5.6, 3.9), ylim = c(-3.6, 3.8))
+title(main = "Module associations with activated microglia \n and cognitive decline", line = 0.5)
+points(TADmod[names(PmicrogliaFCOR)], TGm2[names(PmicrogliaFCOR)], cex = cex, col = col)
+
+text(TADmod[names(PmicrogliaFCOR)], TGm2[names(PmicrogliaFCOR)], names(PmicrogliaFCOR), cex = cex / 4, col = col)
+abline(h = 0, v = 0, col = "darkgray", lty = 2)
+
+grid()
+
+```
+
+
+# Table 2 - P-values for associations of modules to clinical and pathologic traits
+
+```{r module2traits}
+u = c('116','115','114','113','5')
+y = ModResults[u,c("cogDec", "NP","DP","NFT" ,"TA","AM","msex","age_death")]
+colnames(y) = c('P.value.Cognitive.decline','P.value.Neuritic.Plaques','P.value.Diffuse.Plaques','P.value.Neurofibrillary.tangles','P.value.Tau','P.value.Amyloid','P.value.Sex','P.value.Age')
+X = cbind(Module = u,signif(data.frame(P.value.Activated.Microglia = PGm[u],y),2))
+rownames(X) = NULL
+
+DT::datatable(X,  escape = FALSE, caption = "Table 2 - P-values for associations of modules to clinical and pathologic traits",
+                            options = list(
+                                paging = TRUE,
+                                searching = TRUE,
+                                fixedColumns = TRUE,
+                                autoWidth = TRUE,
+                                ordering = TRUE,
+                                dom = 'Bfrtip'
+                            )
+                       )
+
+
+u = c('116','115','114','113','5')
+y = ModResultsCoef[u,c("cogDec", "NP","DP","NFT" ,"TA","AM","msex","age_death")]
+colnames(y) = c('Coef.Cognitive.decline','Coef.Neuritic.Plaques','Coef.Diffuse.Plaques','Coef.Neurofibrillary.tangles','Coef.Tau','Coef.Amyloid','Coef.Sex','Coef.Age')
+X = cbind(Module = u,signif(data.frame(Coef.Activated.Microglia = CGm[u],y),2))
+rownames(X) = NULL
+
+DT::datatable(X,  escape = FALSE, caption = "Table 2 - Coefficients of associations of modules to clinical and pathologic traits",
+                            options = list(
+                                paging = TRUE,
+                                searching = TRUE,
+                                fixedColumns = TRUE,
+                                autoWidth = TRUE,
+                                ordering = TRUE,
+                                dom = 'Bfrtip'
+                            )
+                       )
+```
+
+
+# Table 3 - Top ten genes in module 5 that are most associated with a combined score for association with activated microglia and cognitive decline.
+
+```{r topTenGenes}
+
+u <- mod2ens[['5']]
+X <- data.frame(Gene = geneSymbol[u],Ensembl = u,MGgene = u%in%MicrogliaGenesFC, MG.expression = round(a1[u],1),Bulk.expression = round(a2[u],1),T.actGlia = TG[u],P.actGlia = signif(PG[u],2),T.AD = TAD[u],P.AD = signif(PAD[u],2))
+X <- data.frame(X, Combined.score = X$T.actGlia-X$T.AD)
+X <- X[order(-X$T.actGlia+X$T.AD),]
+
+
+DT::datatable(head(X,10),  escape = FALSE, caption = "Table 3 - Top ten genes in module 5 that are most associated with a combined score for association with activated microglia and cognitive decline.",
+                            options = list(
+                                paging = TRUE,
+                                searching = TRUE,
+                                fixedColumns = TRUE,
+                                autoWidth = TRUE,
+                                ordering = TRUE,
+                                dom = 'Bfrtip'
+                            )
+                       )
+
+```
+
+
+
+
+
+
+# Figure 4 – Immunofluorescence reveals VASP+TMEM119+ cells have activated morphology.
+
+### Figure 4b - Relative spread between VASP+ and VASP- cells
+
+```{r Figure_4b, fig.height=4, fig.width=2.5}
+
+# Read in image data
+VASP <- read.csv("Data/VaspCells.csv")
+y <- lapply(split(VASP$ImageNumber, VASP$Metadata_subject), function(x) as.character(unique(x)))
+
+# Read in pathology information for subjects
+pathData <- read.csv("Data/VaspPatho.csv")
+rownames(pathData) <- pathData$projid
+samp <- as.character(pathData$projid[order(pathData$braaksc)])
+
+
+fm1 <- lmer(AreaShape_Compactness ~ Children_VaspPositiveTMEM_Count + (1 | Metadata_subject), VASP)
+nofixedlmm <- lmer(AreaShape_Compactness ~ 1 + (1 | Metadata_subject), VASP)
+anova(fm1, nofixedlmm)
+
+
+
+x <- split(VASP, paste(VASP$ImageNumber))
+x1 <- lapply(x, function(x) (mean(x$AreaShape_Compactness[x$Children_VaspPositiveTMEM_Count == 1]) / mean(x$AreaShape_Compactness[x$Children_VaspPositiveTMEM_Count == 0])))
+z <- lapply(y, function(x) unlist(x1[x]))
+df <- data.frame(FC = log2(unlist(z[samp])))
+
+ggplot(df, aes(y = FC, x = "")) +
+  geom_boxplot(fill = "#FC8D62", colour = "#FC8D62", alpha = 0.5) +
+  theme_classic() +
+  ylab("log2 ( Spread of VASP+ / Spread of VASP- )") +
+  xlab("") +
+  ggtitle("Relative spread of\nVASP+ vs VASP- cells") +
+  theme(plot.title = element_text(hjust = 0.5), axis.ticks = element_blank()) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme(axis.line.x = element_line(colour = "white", size = 1, linetype = "solid"))
+
+
+```
+
+### Figure 4c - Proportion of VASP+ cells associated with Braak and CERAD
+
+```{r Figure_4c, fig.width=4, fig.height=4}
+
+prop <- lapply(y, function(z) unlist(lapply(x, function(x) mean(x$Children_VaspPositiveTMEM_Count == 1))[z]))
+df <- data.frame(prop = unlist(prop), subject = factor(rep(names(prop), unlist(lapply(prop, length))), levels = samp))
+
+ggplot(df, aes(y = prop, x = subject)) +
+  geom_boxplot(fill = "#8DA0CB", colour = "#8DA0CB", alpha = 0.5) +
+  theme_classic() +
+  scale_x_discrete(breaks = samp, labels = c("Braak   0\nCERAD   2\nNIA-Reagan  4", "3\n4\n3", "4\n2\n2", "5\n1\n1", "5\n1\n1", "5\n1\n1")) +
+  theme(axis.text.x = element_text(hjust = 1)) +
+  xlab("Subject") +
+  ylab("Proportion of VASP+ microglia")
+
+
+m1 <- lm(as.numeric(pathData[, "braaksc"]) ~ tapply(df$prop, df$subject, mean)[rownames(pathData)])
+summary(m1)
+
+```
+
+
+
+
+
